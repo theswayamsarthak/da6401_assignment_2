@@ -9,6 +9,12 @@ class IoULoss(nn.Module):
     """
 
     def __init__(self, eps: float = 1e-6, reduction: str = "mean"):
+        """
+        Initialize the IoULoss module.
+        Args:
+            eps: Small value to avoid division by zero.
+            reduction: Specifies the reduction to apply to the output: 'mean' | 'sum'.
+        """
         super().__init__()
         self.eps = eps
         self.reduction = reduction

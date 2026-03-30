@@ -7,6 +7,9 @@ This repository is an instructional skeleton for building the complete visual pe
 - Ensure VGG11 is implemented according to the official paper(https://arxiv.org/abs/1409.1556). The only difference being injecting BatchNorm and CustomDropout layers is your design choice.
 - Train all the networks on normalized images as input (as the test set given by autograder will be normalized images).
 - The output of Localization model = [x_center, y_center, width, height] all these numbers are with respect to image coordinates, in pixel space (not normalized)
+- Train the object localization network with the following loss function: MSE + custom_IOU_loss.
+- Make sure the custom_IOU loss is in range: [0,1]
+- In the custom IOU loss, you have to implement all the two reduction types: ["mean", "sum"] and the default reduction type should be "mean". You may include any other reduction type as well, which will help your network learn better.
 - multitask.py shd load the saved checkpoints (classifier.pth, localizer.pth, unet.pth), initialize the shared backbone and heads with these trained weights and do prediction.
 - Keep paths as relative paths for loading in multitask.py
 - Assume input image size is fixed according to vgg11 paper(can be hardcoded need not pass as args)
