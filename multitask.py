@@ -1,5 +1,4 @@
 import os
-
 import torch
 import torch.nn as nn
 
@@ -7,17 +6,6 @@ from models.vgg11 import VGG11Encoder
 from models.classification import ClassificationHead
 from models.localization import LocalizationHead
 from models.segmentation import DecoderBlock, FinalUpsample
-
-
-def _load_state_dict(path, device):
-    ckpt = torch.load(path, map_location=device)
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        return ckpt["state_dict"]
-    return ckpt
-
-
-def _extract(state_dict, prefix):
-    return {k[len(prefix):]: v for k, v in state_dict.items() if k.startswith(prefix)}
 
 
 class MultiTaskPerceptionModel(nn.Module):
@@ -43,42 +31,71 @@ class MultiTaskPerceptionModel(nn.Module):
         self.encoder  = VGG11Encoder(in_channels=in_channels)
         self.cls_head = ClassificationHead(num_classes=num_breeds)
         self.loc_head = LocalizationHead()
-
-        self.dec4 = DecoderBlock(512, 512, 512)
-        self.dec3 = DecoderBlock(512, 256, 256)
-        self.dec2 = DecoderBlock(256, 128, 128)
-        self.dec1 = DecoderBlock(128, 64, 64)
-        self.dec0 = FinalUpsample(64, 32)
+        self.dec4     = DecoderBlock(512, 512, 512)
+        self.dec3     = DecoderBlock(512, 256, 256)
+        self.dec2     = DecoderBlock(256, 128, 128)
+        self.dec1     = DecoderBlock(128, 64, 64)
+        self.dec0     = FinalUpsample(64, 32)
         self.seg_head = nn.Conv2d(32, seg_classes, kernel_size=1)
 
-        self._load_checkpoints(classifier_path, localizer_path, unet_path, device)
+        self._load_all(classifier_path, localizer_path, unet_path, device)
         self.to(device)
 
-    def _load_checkpoints(self, cls_path, loc_path, unet_path, device):
+    def _get_sd(self, path, device):
+        ckpt = torch.load(path, map_location=device)
+        return ckpt.get("state_dict", ckpt)
+
+    def _strip(self, sd, prefix):
+        return {k[len(prefix):]: v
+                for k, v in sd.items()
+                if k.startswith(prefix)}
+
+    def _load_all(self, cls_path, loc_path, unet_path, device):
+
+        # --- classifier.pth ---
         if os.path.isfile(cls_path):
-            sd    = _load_state_dict(cls_path, device)
-            enc_w = _extract(sd, "encoder.")
-            if enc_w:
-                self.encoder.load_state_dict(enc_w, strict=True)
-            cls_w = _extract(sd, "head.")
-            if cls_w:
-                self.cls_head.load_state_dict(cls_w, strict=True)
+            sd = self._get_sd(cls_path, device)
 
+            # encoder weights — keys like "encoder.block1.0.0.weight"
+            enc_sd = self._strip(sd, "encoder.")
+            if enc_sd:
+                self.encoder.load_state_dict(enc_sd, strict=True)
+                print(f"  loaded encoder from {cls_path}")
+
+            # cls head weights — keys like "head.fc.1.weight"
+            # ClassificationHead expects keys like "fc.1.weight"
+            cls_sd = self._strip(sd, "head.")
+            if cls_sd:
+                self.cls_head.load_state_dict(cls_sd, strict=True)
+                print(f"  loaded cls_head from {cls_path}")
+
+        # --- localizer.pth ---
         if os.path.isfile(loc_path):
-            sd    = _load_state_dict(loc_path, device)
-            loc_w = _extract(sd, "head.")
-            if loc_w:
-                self.loc_head.load_state_dict(loc_w, strict=True)
+            sd = self._get_sd(loc_path, device)
 
+            # loc head weights — keys like "head.regressor.1.weight"
+            # LocalizationHead expects keys like "regressor.1.weight"
+            loc_sd = self._strip(sd, "head.")
+            if loc_sd:
+                self.loc_head.load_state_dict(loc_sd, strict=True)
+                print(f"  loaded loc_head from {loc_path}")
+
+        # --- unet.pth ---
         if os.path.isfile(unet_path):
-            sd = _load_state_dict(unet_path, device)
+            sd = self._get_sd(unet_path, device)
+
+            # decoder keys are already without prefix e.g. "dec4.upsample.weight"
             for name in ("dec4", "dec3", "dec2", "dec1", "dec0"):
-                w = _extract(sd, f"{name}.")
-                if w:
-                    getattr(self, name).load_state_dict(w, strict=True)
-            seg_w = _extract(sd, "seg_head.")
-            if seg_w:
-                self.seg_head.load_state_dict(seg_w, strict=True)
+                part_sd = self._strip(sd, f"{name}.")
+                if part_sd:
+                    getattr(self, name).load_state_dict(part_sd, strict=True)
+            print(f"  loaded decoder from {unet_path}")
+
+            # seg head — keys "seg_head.weight", "seg_head.bias"
+            seg_sd = self._strip(sd, "seg_head.")
+            if seg_sd:
+                self.seg_head.load_state_dict(seg_sd, strict=True)
+                print(f"  loaded seg_head from {unet_path}")
 
     def forward(self, x: torch.Tensor):
         bottleneck, feats = self.encoder(x, return_features=True)
