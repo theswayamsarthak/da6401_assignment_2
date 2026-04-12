@@ -2,9 +2,9 @@
 Training script for all three tasks.
 
 Usage:
-    python train.py --task classification --epochs 30 --lr 1e-3
-    python train.py --task localization   --epochs 30 --lr 1e-4 --freeze_encoder
-    python train.py --task segmentation   --epochs 30 --lr 1e-4 --freeze_encoder
+    python train.py --task classification --epochs 30 --lr 3e-4  --batch_size 64 --dropout 0.3
+    python train.py --task localization   --epochs 50 --lr 1e-4  --batch_size 64 --dropout 0.3 --freeze_encoder
+    python train.py --task segmentation   --epochs 30 --lr 1e-4  --batch_size 64 --dropout 0.3 --freeze_encoder
 """
 
 import argparse
@@ -20,10 +20,42 @@ from models.classification import VGG11Classifier
 from models.localization import VGG11Localizer
 from models.segmentation import VGG11UNet
 from losses.iou_loss import IoULoss
-from pets_dataset import OxfordIIITPetDataset
+from data.pets_dataset import OxfordIIITPetDataset
 
+# MPS performance tuning
+os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+
+IMG_SIZE = 224
+
+
+# ---- Early Stopping --------------------------------------------------------
+
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0.001):
+        self.patience  = patience
+        self.min_delta = min_delta
+        self.counter   = 0
+        self.best      = None
+
+    def __call__(self, metric, higher_is_better=True):
+        score = metric if higher_is_better else -metric
+        if self.best is None:
+            self.best = score
+            return False
+        if score > self.best + self.min_delta:
+            self.best = score
+            self.counter = 0
+            return False
+        self.counter += 1
+        print(f"  no improvement {self.counter}/{self.patience}")
+        return self.counter >= self.patience
+
+
+# ---- Helpers ---------------------------------------------------------------
 
 def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -35,6 +67,7 @@ def save_ckpt(model, epoch, metric, path):
 
 def load_encoder_weights(model, ckpt_path, device):
     if not os.path.isfile(ckpt_path):
+        print(f"  warning: checkpoint not found at {ckpt_path}, skipping encoder load")
         return
     ckpt = torch.load(ckpt_path, map_location=device)
     sd = ckpt.get("state_dict", ckpt)
@@ -49,38 +82,43 @@ def load_encoder_weights(model, ckpt_path, device):
 def train_classification(args, device):
     model = VGG11Classifier(num_classes=37, dropout_p=args.dropout).to(device)
     optim = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.StepLR(optim, step_size=10, gamma=0.1)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs, eta_min=1e-5)
     crit  = nn.CrossEntropyLoss()
 
     train_dl = DataLoader(
         OxfordIIITPetDataset(args.data_root, "trainval", "classification", augment=True),
-        batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True,
+        batch_size=args.batch_size, shuffle=True,
+        num_workers=6, pin_memory=False, persistent_workers=True,
     )
     val_dl = DataLoader(
         OxfordIIITPetDataset(args.data_root, "test", "classification"),
-        batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True,
+        batch_size=args.batch_size * 2, shuffle=False,
+        num_workers=6, pin_memory=False, persistent_workers=True,
     )
 
-    wandb.init(project=args.wandb_project, name="classification", config=vars(args))
-    best = 0.0
+    wandb.init(project=args.wandb_project, name=f"cls-dropout-{args.dropout}", config=vars(args))
+    best    = 0.0
+    stopper = EarlyStopping(patience=5)
 
     for ep in range(1, args.epochs + 1):
         model.train()
         tl = tc = tn = 0
         for batch in train_dl:
             imgs, labels = batch["image"].to(device), batch["label"].to(device)
-            optim.zero_grad()
-            loss = crit(model(imgs), labels)
+            optim.zero_grad(set_to_none=True)
+            logits = model(imgs)
+            loss   = crit(logits, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
             tl += loss.item() * imgs.size(0)
-            tc += (model(imgs).detach().argmax(1) == labels).sum().item()
+            tc += (logits.detach().argmax(1) == labels).sum().item()
             tn += imgs.size(0)
         sched.step()
 
         model.eval()
         vl = vc = vn = 0
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in val_dl:
                 imgs, labels = batch["image"].to(device), batch["label"].to(device)
                 logits = model(imgs)
@@ -98,10 +136,14 @@ def train_classification(args, device):
             best = val_acc
             save_ckpt(model, ep, best, "classifier.pth")
 
+        if stopper(val_acc, higher_is_better=True):
+            print("Early stopping.")
+            break
+
     wandb.finish()
 
 
-# ---- Task 2: Localization -----------------------------------------
+# ---- Task 2: Localization --------------------------------------------------
 
 def train_localization(args, device):
     model = VGG11Localizer(dropout_p=args.dropout).to(device)
@@ -116,57 +158,78 @@ def train_localization(args, device):
 
     optim    = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
                                 lr=args.lr, weight_decay=1e-4)
-    sched    = torch.optim.lr_scheduler.StepLR(optim, step_size=10, gamma=0.1)
+    sched    = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs, eta_min=1e-6)
     mse_loss = nn.MSELoss()
     iou_loss = IoULoss(reduction="mean")
 
     train_dl = DataLoader(
         OxfordIIITPetDataset(args.data_root, "trainval", "localization", augment=True),
-        batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True,
+        batch_size=args.batch_size, shuffle=True,
+        num_workers=6, pin_memory=False, persistent_workers=True,
     )
     val_dl = DataLoader(
         OxfordIIITPetDataset(args.data_root, "test", "localization"),
-        batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True,
+        batch_size=args.batch_size * 2, shuffle=False,
+        num_workers=6, pin_memory=False, persistent_workers=True,
     )
 
     wandb.init(project=args.wandb_project, name="localization", config=vars(args))
-    best = float("inf")
+    best    = float("inf")
+    stopper = EarlyStopping(patience=7)
 
     for ep in range(1, args.epochs + 1):
         model.train()
-        tl = tn = 0
+        tl = ti = tn = 0
         for batch in train_dl:
             imgs, boxes = batch["image"].to(device), batch["bbox"].to(device)
-            optim.zero_grad()
-            pred = model(imgs)
-            loss = mse_loss(pred, boxes) + iou_loss(pred, boxes)
+            optim.zero_grad(set_to_none=True)
+            pred       = model(imgs)
+            mse        = mse_loss(pred, boxes) / (IMG_SIZE ** 2)
+            iou        = iou_loss(pred, boxes)
+            loss       = mse + iou
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
             tl += loss.item() * imgs.size(0)
+            ti += iou.item()  * imgs.size(0)
             tn += imgs.size(0)
         sched.step()
 
+        # val loop — IoU only (MSE not meaningful without real test XMLs)
         model.eval()
-        vl = vi = vn = 0
-        with torch.no_grad():
+        vi = vn = 0
+        with torch.inference_mode():
             for batch in val_dl:
                 imgs, boxes = batch["image"].to(device), batch["bbox"].to(device)
                 pred = model(imgs)
-                vl += (mse_loss(pred, boxes) + iou_loss(pred, boxes)).item() * imgs.size(0)
-                vi += iou_loss(pred, boxes).item() * imgs.size(0)
-                vn += imgs.size(0)
+                vi  += iou_loss(pred, boxes).item() * imgs.size(0)
+                vn  += imgs.size(0)
 
-        wandb.log({"epoch": ep, "train/loss": tl/tn, "val/loss": vl/vn, "val/iou_loss": vi/vn})
-        print(f"[loc] ep {ep:03d}  train_loss={tl/tn:.4f}  val_iou={vi/vn:.4f}")
+        train_loss = tl / tn
+        train_iou  = ti / tn
+        val_iou    = vi / vn
 
-        if vi/vn < best:
-            best = vi / vn
+        wandb.log({
+            "epoch":      ep,
+            "train/loss": train_loss,
+            "train/iou":  train_iou,
+            "val/iou":    val_iou,
+        })
+        print(f"[loc] ep {ep:03d}  train_loss={train_loss:.4f}  train_iou={train_iou:.4f}  val_iou={val_iou:.4f}")
+
+        # save on train loss improvement (val bbox labels unreliable for test split)
+        if train_loss < best:
+            best = train_loss
             save_ckpt(model, ep, best, "localizer.pth")
+
+        if stopper(train_loss, higher_is_better=False):
+            print("Early stopping.")
+            break
 
     wandb.finish()
 
 
-# ---- Task 3: Segmentation -----------------------------------------------------------
+# ---- Task 3: Segmentation --------------------------------------------------
 
 def dice_score(pred_logits, target, num_classes=3, eps=1e-6):
     pred = pred_logits.argmax(1)
@@ -191,20 +254,23 @@ def train_segmentation(args, device):
 
     optim = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()),
                              lr=args.lr, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.StepLR(optim, step_size=10, gamma=0.1)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs, eta_min=1e-6)
     crit  = nn.CrossEntropyLoss()
 
     train_dl = DataLoader(
         OxfordIIITPetDataset(args.data_root, "trainval", "segmentation", augment=True),
-        batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True,
+        batch_size=args.batch_size, shuffle=True,
+        num_workers=6, pin_memory=False, persistent_workers=True,
     )
     val_dl = DataLoader(
         OxfordIIITPetDataset(args.data_root, "test", "segmentation"),
-        batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True,
+        batch_size=args.batch_size * 2, shuffle=False,
+        num_workers=6, pin_memory=False, persistent_workers=True,
     )
 
     wandb.init(project=args.wandb_project, name="segmentation", config=vars(args))
-    best = 0.0
+    best    = 0.0
+    stopper = EarlyStopping(patience=5)
 
     for ep in range(1, args.epochs + 1):
         model.train()
@@ -212,9 +278,11 @@ def train_segmentation(args, device):
         for batch in train_dl:
             imgs  = batch["image"].to(device)
             masks = batch["mask"].to(device)
-            optim.zero_grad()
-            loss = crit(model(imgs), masks)
+            optim.zero_grad(set_to_none=True)
+            logits = model(imgs)
+            loss   = crit(logits, masks)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optim.step()
             tl += loss.item() * imgs.size(0)
             tn += imgs.size(0)
@@ -222,7 +290,7 @@ def train_segmentation(args, device):
 
         model.eval()
         vl = vd = vn = 0
-        with torch.no_grad():
+        with torch.inference_mode():
             for batch in val_dl:
                 imgs  = batch["image"].to(device)
                 masks = batch["mask"].to(device)
@@ -238,23 +306,29 @@ def train_segmentation(args, device):
             best = vd / vn
             save_ckpt(model, ep, best, "unet.pth")
 
+        if stopper(vd/vn, higher_is_better=True):
+            print("Early stopping.")
+            break
+
     wandb.finish()
 
 
-# ---------------------------------------------------------------------------
+# ---- Args ------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--task",          choices=["classification", "localization", "segmentation"], required=True)
-    p.add_argument("--data_root",     default="data/oxford-iiit-pet")
-    p.add_argument("--epochs",        type=int,   default=30)
-    p.add_argument("--batch_size",    type=int,   default=32)
-    p.add_argument("--lr",            type=float, default=1e-3)
-    p.add_argument("--dropout",       type=float, default=0.5)
+    p.add_argument("--task",           choices=["classification", "localization", "segmentation"], required=True)
+    p.add_argument("--data_root",      default="data")
+    p.add_argument("--epochs",         type=int,   default=30)
+    p.add_argument("--batch_size",     type=int,   default=64)
+    p.add_argument("--lr",             type=float, default=3e-4)
+    p.add_argument("--dropout",        type=float, default=0.3)
     p.add_argument("--freeze_encoder", action="store_true")
-    p.add_argument("--wandb_project", default="da6401-assignment2")
+    p.add_argument("--wandb_project",  default="da6401-assignment2")
     return p.parse_args()
 
+
+# ---- Main ------------------------------------------------------------------
 
 if __name__ == "__main__":
     args   = parse_args()
