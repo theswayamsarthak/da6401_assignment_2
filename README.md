@@ -4,7 +4,7 @@ Implementation of a multi-task visual perception pipeline on the Oxford-IIIT Pet
 
 ## Links
 
-- WandB Report: [YOUR_WANDB_LINK_HERE](https://wandb.ai/theswayamsarthak-iitmaana/da6401-assignment2/reports/Visual-Perception-Pipeline--VmlldzoxNjQ5MzkyMg?accessToken=tp85rhw7mnzdn91mbza524qz8qy7z84z73cxztjct28vjjzhtq6phzcbe6chxxem)
+- WandB Report: [DA6401 Assignment - 2 by Swayam Sarthak ee23b079](https://wandb.ai/theswayamsarthak-iitmaana/da6401-assignment2/reports/Visual-Perception-Pipeline--VmlldzoxNjQ5MzkyMg?accessToken=tp85rhw7mnzdn91mbza524qz8qy7z84z73cxztjct28vjjzhtq6phzcbe6chxxem)
 - GitHub Repo: YOUR_GITHUB_LINK_HERE
 
 ## Tasks
